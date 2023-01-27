@@ -11,8 +11,11 @@ import optax
 from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
 from tqdm.auto import tqdm
-from transformers import (AutoTokenizer, FlaxAutoModelForTokenClassification,
-                          FlaxRobertaForTokenClassification)
+from transformers import (
+    AutoTokenizer,
+    FlaxAutoModelForTokenClassification,
+    FlaxRobertaForTokenClassification,
+)
 from transformers.modeling_flax_outputs import FlaxTokenClassifierOutput
 
 import wandb
@@ -200,7 +203,7 @@ if __name__ == "__main__":
         hf_dataset_path,
         "validation",
         tokenizer,
-        num_epochs,
+        1 / eval_subsample_multiplier,
         train_batch_size,
         max_length,
         subsampling_multiplier=eval_subsample_multiplier,
