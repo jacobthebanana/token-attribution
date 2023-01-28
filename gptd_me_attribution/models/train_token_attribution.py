@@ -54,15 +54,17 @@ def loss_accuracy_fn(
     per_sequence_value_sum = jnp.sum(masked_token_values, axis=-1)  # (batch,)
 
     if normalize_by_length:
-        per_sequence_num_real_tokens = jnp.sum(batch.attention_mask, axis=1)
+        per_sequence_num_real_tokens = jnp.sum(token_mask, axis=1)
         per_sequence_value_reference = (
             per_sequence_num_real_tokens * batch.labels
         )  # (batch,)
+        decision_threshold = per_sequence_num_real_tokens / 2
     else:
         per_sequence_value_reference = 1000.0 * batch.labels  # (batch,)
-    chex.assert_equal_shape((per_sequence_value_sum, per_sequence_value_reference))
+        decision_threshold = 500
 
-    predictions = jnp.where(per_sequence_value_sum > 500, 1, 0)
+    chex.assert_equal_shape((per_sequence_value_sum, per_sequence_value_reference))
+    predictions = jnp.where(per_sequence_value_sum > decision_threshold, 1, 0)
     num_correct = jnp.sum(predictions == batch.labels)
     correct_ratio = num_correct / len(batch.labels)
 
@@ -165,7 +167,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--normalize_by_length",
-        type=bool,
+        type=int,
         default=False,
         help="Normalize value by number of tokens in example.",
     )
@@ -182,7 +184,7 @@ if __name__ == "__main__":
     eval_every: int = args.eval_every
     eval_subsample_multiplier: int = args.eval_subsample_multiplier
     early_stop_threshold: int = args.early_stop_threshold
-    normalize_by_length: bool = args.normalize_by_length
+    normalize_by_length: bool = bool(args.normalize_by_length)
 
     wandb_run_name = datetime.datetime.now().isoformat() + "-" + socket.gethostname()
     wandb.init(name=wandb_run_name)
