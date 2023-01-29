@@ -2,7 +2,7 @@ import argparse
 import datetime
 import os
 import socket
-from typing import Callable, Dict, Iterator, Literal, Optional, Tuple, Union
+from typing import Callable, Dict, Iterator, Literal, Optional, Tuple, Union, Any
 
 import chex
 import jax
@@ -14,9 +14,10 @@ from tqdm.auto import tqdm
 from transformers import (
     AutoTokenizer,
     FlaxAutoModelForTokenClassification,
-    FlaxRobertaForTokenClassification,
+    FlaxRobertaForSequenceClassification,
 )
-from transformers.modeling_flax_outputs import FlaxTokenClassifierOutput
+from transformers.modeling_flax_outputs import FlaxSequenceClassifierOutput
+from sklearn.metrics import confusion_matrix
 
 import wandb
 
@@ -26,53 +27,42 @@ Params = Dict
 Gradients = Dict
 Loss = jnp.ndarray
 CorrectRatio = jnp.ndarray
-EvalStats = Dict[Literal["loss", "accuracy"], float]
+Predictions = jnp.ndarray
+EvalStats = Dict[Literal["loss", "accuracy", "confusion_matrix"], Any]
 
 
 def loss_accuracy_fn(
-    batch: Batch, params: Dict, apply_fn: Callable, regularization: float
-) -> Tuple[Loss, CorrectRatio]:
+    batch: Batch, params: Dict, apply_fn: Callable
+) -> Tuple[Loss, Tuple[CorrectRatio, Predictions]]:
     """
     Return mean squared error between labels and
     the sum of output logits over sequence,
     as well as prediction accuracy if split at 0.5.
 
-    If normalize_by_length = True, the sequence-level value
-    would be normalized by the number of non-padding tokens
-    in the sequence.
     """
     model_output = apply_fn(batch.input_ids, batch.attention_mask, params=params)
 
-    assert isinstance(model_output, FlaxTokenClassifierOutput)
-    token_values = model_output.logits.squeeze(-1)  # (batch, token)
+    assert isinstance(model_output, FlaxSequenceClassifierOutput)
+    output_logits = model_output.logits  # (batch, class)
+    per_sequence_loss = optax.softmax_cross_entropy_with_integer_labels(
+        output_logits, batch.labels
+    )
 
-    # Exclude "CLS" logit from output.
-    token_mask = batch.attention_mask.at[:, 0].set(0)
-    chex.assert_equal_shape((token_mask, token_values))
-    masked_token_values = token_values * token_mask
-
-    per_sequence_value_tanh = jnp.tanh(masked_token_values * token_mask)  # (batch,)
-    per_sequence_value_mean = jnp.mean(per_sequence_value_tanh, axis=-1)  # (batch,)
-    per_sequence_value_l1 = jnp.linalg.norm(
-        per_sequence_value_tanh, ord=1, axis=-1
-    )  # (batch,)
-
-    chex.assert_equal_shape((per_sequence_value_mean, batch.labels))
-    predictions = jnp.where(per_sequence_value_mean > 0, 1, -1)
+    predictions = jnp.argmax(output_logits, axis=-1).reshape((-1,))
+    assert predictions.shape == batch.labels.shape, (
+        predictions.shape,
+        batch.labels.shape,
+    )
     num_correct = jnp.sum(predictions == batch.labels)
     correct_ratio = num_correct / len(batch.labels)
 
-    per_sequence_loss = jnp.linalg.norm(per_sequence_value_mean - batch.labels, ord=2)
     loss = jnp.mean(per_sequence_loss)
-    regularized_loss = (
-        regularization * per_sequence_value_l1 + (1 - per_sequence_value_l1) * loss
-    )
-    return regularized_loss, correct_ratio
+    return loss, (correct_ratio, predictions)
 
 
 def loss_grad_fn(
-    batch: Batch, params: Union[Dict, FrozenDict], apply_fn, regularization: float
-) -> Tuple[Tuple[Loss, CorrectRatio], Gradients]:
+    batch: Batch, params: Union[Dict, FrozenDict], apply_fn: Callable
+) -> Tuple[Tuple[Loss, Tuple[CorrectRatio, Predictions]], Gradients]:
     ...
 
 
@@ -80,61 +70,59 @@ loss_grad_fn = jax.value_and_grad(loss_accuracy_fn, has_aux=True, argnums=1)
 
 
 def train_step(
-    batch: Batch, state: TrainState, regularization: float
+    batch: Batch, state: TrainState
 ) -> Tuple[TrainState, Tuple[Loss, CorrectRatio]]:
-    (loss, accuracy), gradients = loss_grad_fn(
-        batch, state.params, state.apply_fn, regularization
-    )
+    (loss, (accuracy, _)), gradients = loss_grad_fn(batch, state.params, state.apply_fn)
     new_state = state.apply_gradients(grads=gradients)
     return new_state, (loss, accuracy)
 
 
 def jit_train_step(
-    batch: Batch, state: TrainState, regularization: float
+    batch: Batch, state: TrainState
 ) -> Tuple[TrainState, Tuple[Loss, CorrectRatio]]:
     ...
 
 
-jit_train_step = jax.jit(
-    train_step,
-    static_argnames=["normalize_by_length", "regularization"],
-    donate_argnums=1,
-)
+jit_train_step = jax.jit(train_step, donate_argnums=1)  # type: ignore
 
 
 def jit_loss_accuracy_fn(
-    batch: Batch, params: FrozenDict, apply_fn: Callable, regularization: float
-) -> Tuple[Loss, CorrectRatio]:
+    batch: Batch, params: FrozenDict, apply_fn: Callable
+) -> Tuple[Loss, Tuple[CorrectRatio, Predictions]]:
     ...
 
 
-jit_loss_accuracy_fn = jax.jit(
-    loss_accuracy_fn, static_argnames=["apply_fn", "normalize_by_length"]
-)
+jit_loss_accuracy_fn = jax.jit(loss_accuracy_fn, static_argnames=["apply_fn"])
 
 
 def evaluate_model(
     apply_fn: Callable,
     params: FrozenDict,
     dataloader: Iterator[Batch],
-    regularization: float,
     num_eval_steps: Optional[int] = None,
 ) -> EvalStats:
     loss_tally = 0.0
     accuracy_tally = 0.0
     num_batches = 0
 
+    all_labels = []
+    all_predictions = []
+
     for batch in tqdm(
         dataloader, ncols=80, desc="Evaluating", leave=False, total=num_eval_steps
     ):
-        loss, accuracy = jit_loss_accuracy_fn(batch, params, apply_fn, regularization)
+        loss, (accuracy, predictions) = jit_loss_accuracy_fn(batch, params, apply_fn)
         loss_tally += loss.item()
         accuracy_tally += accuracy.item()
         num_batches += 1
 
+        all_labels.extend(batch.labels.flatten().tolist())
+        all_predictions.extend(predictions.flatten().tolist())
+
     stats: EvalStats = {
         "loss": loss_tally / num_batches,
         "accuracy": accuracy_tally / num_batches,
+        "confusion_matrix": confusion_matrix(all_labels, all_predictions),
     }
     return stats
 
@@ -158,12 +146,6 @@ if __name__ == "__main__":
         default=6,
         help="Number of steps compared when early stopping.",
     )
-    parser.add_argument(
-        "--normalize_by_length",
-        type=int,
-        default=False,
-        help="Normalize value by number of tokens in example.",
-    )
 
     args = parser.parse_args()
     learning_rate: float = args.learning_rate
@@ -178,7 +160,6 @@ if __name__ == "__main__":
     eval_every: int = args.eval_every
     eval_subsample_multiplier: int = args.eval_subsample_multiplier
     early_stop_threshold: int = args.early_stop_threshold
-    normalize_by_length: bool = bool(args.normalize_by_length)
 
     wandb_run_name = datetime.datetime.now().isoformat() + "-" + socket.gethostname()
     wandb.init(name=wandb_run_name)
@@ -206,10 +187,10 @@ if __name__ == "__main__":
     )
 
     # Model, Optimization, and (single-host only) sharding.
-    model: FlaxRobertaForTokenClassification
-    model = FlaxAutoModelForTokenClassification.from_pretrained(
-        base_hf_model, from_pt=True, num_labels=1
-    )
+    model: FlaxRobertaForSequenceClassification
+    model = FlaxRobertaForSequenceClassification.from_pretrained(
+        base_hf_model, from_pt=True
+    )  # type: ignore
     sharding_scheme = jax.sharding.PositionalSharding(jax.devices()).replicate()
     params: FrozenDict = jax.device_put(model.params, sharding_scheme)
 
@@ -239,7 +220,6 @@ if __name__ == "__main__":
                 model.__call__,
                 train_state.params,
                 init_eval_dataloader(),
-                regularization,
                 num_eval_steps,
             )
             stats = {**stats, **{"validation_" + k: v for k, v in eval_stats.items()}}

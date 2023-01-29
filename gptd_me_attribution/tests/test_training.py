@@ -9,13 +9,14 @@ import optax
 from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
 from jax.sharding import PositionalSharding
-from transformers import AutoTokenizer, FlaxRobertaForTokenClassification
+from transformers import AutoTokenizer, FlaxRobertaForSequenceClassification
 
 from ..data.dataloaders import get_dataloader
 from ..models.train_token_attribution import (
     jit_train_step,
     loss_accuracy_fn,
     loss_grad_fn,
+    evaluate_model,
 )
 
 
@@ -23,9 +24,7 @@ def print_shape(tree):
     print(jax.tree_util.tree_map(jnp.shape, tree))
 
 
-EXAMPLE_HF_DATASET = os.environ.get(
-    "EXAMPLE_HF_DATASET", "data/processed/reddit_eli5_tanh"
-)
+EXAMPLE_HF_DATASET = os.environ.get("EXAMPLE_HF_DATASET", "data/processed/reddit_eli5")
 EXAMPLE_HF_MODEL = os.environ.get(
     "EXAMPLE_HF_MODEL", "Hello-SimpleAI/chatgpt-detector-roberta"
 )
@@ -35,16 +34,16 @@ EXAMPLE_NUM_STEPS = int(os.environ.get("EXAMPLE_NUM_STEPS", "12"))
 class BatchedTrainingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model: FlaxRobertaForTokenClassification
-        cls.model = FlaxRobertaForTokenClassification.from_pretrained(
-            EXAMPLE_HF_MODEL, from_pt=True, num_labels=1
+        cls.model: FlaxRobertaForSequenceClassification
+        cls.model = FlaxRobertaForSequenceClassification.from_pretrained(
+            EXAMPLE_HF_MODEL, from_pt=True
         )  # type: ignore
 
     def setUp(self):
         self.dataset = datasets.load_from_disk(EXAMPLE_HF_DATASET)
         self.tokenizer = AutoTokenizer.from_pretrained(EXAMPLE_HF_MODEL)
 
-        self.init_dataloader, num_steps = get_dataloader(
+        self.init_dataloader, self.num_batches = get_dataloader(
             EXAMPLE_HF_DATASET, "train", self.tokenizer, 1.0, 16, 128, 1
         )
         self.model = BatchedTrainingTest.model
@@ -58,23 +57,22 @@ class BatchedTrainingTest(unittest.TestCase):
         dataloader = self.init_dataloader()
         example_batch = next(dataloader)
 
-        loss, accuracy = loss_accuracy_fn(
+        loss, (accuracy, predictions) = loss_accuracy_fn(
             example_batch,
             self.model.params,  # type: ignore
             self.model.__call__,
-            0.1,
         )
 
     def test_gradient(self):
 
-        (loss, accuracy), gradient = loss_grad_fn(
-            self.example_batch, self.params, self.model.__call__, False
+        (loss, (accuracy, predictions)), gradient = loss_grad_fn(
+            self.example_batch, self.params, self.model.__call__
         )
 
-        chex.assert_tree_all_equal_shapes(self.params, gradient)
+        chex.assert_trees_all_equal_shapes(self.params, gradient)
 
     def test_train_step(self):
-        optimizer = optax.adamw(0.0001)
+        optimizer = optax.adamw(0.001)
         opt_state = optimizer.init(self.params)
         sharding = PositionalSharding(jax.devices()).replicate()
         train_state = TrainState(
@@ -90,7 +88,7 @@ class BatchedTrainingTest(unittest.TestCase):
 
         for _ in range(EXAMPLE_NUM_STEPS):
             train_state, (loss, accuracy) = jit_train_step(
-                self.example_batch, train_state, 0.5
+                self.example_batch, train_state
             )
 
             loss_history.append(loss.item())
@@ -99,7 +97,7 @@ class BatchedTrainingTest(unittest.TestCase):
         print(loss_history)
         print(accuracy_history)
 
-        optimizer = optax.adamw(0.0001)
+        optimizer = optax.adamw(0.01)
         opt_state = optimizer.init(self.params)
         train_state = TrainState(
             step=0,
@@ -114,7 +112,7 @@ class BatchedTrainingTest(unittest.TestCase):
 
         for _ in range(EXAMPLE_NUM_STEPS):
             train_state, (loss, accuracy) = jit_train_step(
-                self.example_batch, train_state, 0.1
+                self.example_batch, train_state
             )
 
             loss_history.append(loss.item())
@@ -122,3 +120,13 @@ class BatchedTrainingTest(unittest.TestCase):
 
         print(loss_history)
         print(accuracy_history)
+
+    def test_eval_fn(self):
+        init_dataloader, num_batches = get_dataloader(
+            EXAMPLE_HF_DATASET, "validation", self.tokenizer, 1.0, 16, 128, 1
+        )
+        dataloader = init_dataloader()
+        output = evaluate_model(
+            self.model.__call__, self.params, dataloader, num_batches
+        )
+        print(output)
