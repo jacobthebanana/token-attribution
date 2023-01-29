@@ -12,15 +12,20 @@ from jax.sharding import PositionalSharding
 from transformers import AutoTokenizer, FlaxRobertaForTokenClassification
 
 from ..data.dataloaders import get_dataloader
-from ..models.train_token_attribution import (jit_train_step, loss_accuracy_fn,
-                                              loss_grad_fn)
+from ..models.train_token_attribution import (
+    jit_train_step,
+    loss_accuracy_fn,
+    loss_grad_fn,
+)
 
 
 def print_shape(tree):
     print(jax.tree_util.tree_map(jnp.shape, tree))
 
 
-EXAMPLE_HF_DATASET = os.environ.get("EXAMPLE_HF_DATASET", "data/processed/reddit_eli5")
+EXAMPLE_HF_DATASET = os.environ.get(
+    "EXAMPLE_HF_DATASET", "data/processed/reddit_eli5_tanh"
+)
 EXAMPLE_HF_MODEL = os.environ.get(
     "EXAMPLE_HF_MODEL", "Hello-SimpleAI/chatgpt-detector-roberta"
 )
@@ -57,7 +62,7 @@ class BatchedTrainingTest(unittest.TestCase):
             example_batch,
             self.model.params,  # type: ignore
             self.model.__call__,
-            False,
+            0.1,
         )
 
     def test_gradient(self):
@@ -69,7 +74,7 @@ class BatchedTrainingTest(unittest.TestCase):
         chex.assert_tree_all_equal_shapes(self.params, gradient)
 
     def test_train_step(self):
-        optimizer = optax.adamw(0.001)
+        optimizer = optax.adamw(0.0001)
         opt_state = optimizer.init(self.params)
         sharding = PositionalSharding(jax.devices()).replicate()
         train_state = TrainState(
@@ -85,7 +90,7 @@ class BatchedTrainingTest(unittest.TestCase):
 
         for _ in range(EXAMPLE_NUM_STEPS):
             train_state, (loss, accuracy) = jit_train_step(
-                self.example_batch, train_state, False
+                self.example_batch, train_state, 0.5
             )
 
             loss_history.append(loss.item())
@@ -109,7 +114,7 @@ class BatchedTrainingTest(unittest.TestCase):
 
         for _ in range(EXAMPLE_NUM_STEPS):
             train_state, (loss, accuracy) = jit_train_step(
-                self.example_batch, train_state, True
+                self.example_batch, train_state, 0.1
             )
 
             loss_history.append(loss.item())

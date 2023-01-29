@@ -30,7 +30,7 @@ EvalStats = Dict[Literal["loss", "accuracy"], float]
 
 
 def loss_accuracy_fn(
-    batch: Batch, params: Dict, apply_fn: Callable, normalize_by_length: bool
+    batch: Batch, params: Dict, apply_fn: Callable, regularization: float
 ) -> Tuple[Loss, CorrectRatio]:
     """
     Return mean squared error between labels and
@@ -51,35 +51,27 @@ def loss_accuracy_fn(
     chex.assert_equal_shape((token_mask, token_values))
     masked_token_values = token_values * token_mask
 
-    per_sequence_value_sum = jnp.sum(masked_token_values, axis=-1)  # (batch,)
+    per_sequence_value_tanh = jnp.tanh(masked_token_values * token_mask)  # (batch,)
+    per_sequence_value_mean = jnp.mean(per_sequence_value_tanh, axis=-1)  # (batch,)
+    per_sequence_value_l1 = jnp.linalg.norm(
+        per_sequence_value_tanh, ord=1, axis=-1
+    )  # (batch,)
 
-    if normalize_by_length:
-        per_sequence_num_real_tokens = jnp.sum(token_mask, axis=1)
-        per_sequence_value_reference = (
-            per_sequence_num_real_tokens * batch.labels
-        )  # (batch,)
-        decision_threshold = per_sequence_num_real_tokens / 2
-    else:
-        per_sequence_value_reference = 1000.0 * batch.labels  # (batch,)
-        decision_threshold = 500
-
-    chex.assert_equal_shape((per_sequence_value_sum, per_sequence_value_reference))
-    predictions = jnp.where(per_sequence_value_sum > decision_threshold, 1, 0)
+    chex.assert_equal_shape((per_sequence_value_mean, batch.labels))
+    predictions = jnp.where(per_sequence_value_mean > 0, 1, -1)
     num_correct = jnp.sum(predictions == batch.labels)
     correct_ratio = num_correct / len(batch.labels)
 
-    per_sequence_loss = jnp.linalg.norm(
-        per_sequence_value_sum - per_sequence_value_reference
-    )
+    per_sequence_loss = jnp.linalg.norm(per_sequence_value_mean - batch.labels, ord=2)
     loss = jnp.mean(per_sequence_loss)
-    return loss, correct_ratio
+    regularized_loss = (
+        regularization * per_sequence_value_l1 + (1 - per_sequence_value_l1) * loss
+    )
+    return regularized_loss, correct_ratio
 
 
 def loss_grad_fn(
-    batch: Batch,
-    params: Union[Dict, FrozenDict],
-    apply_fn,
-    normalize_by_length: bool,
+    batch: Batch, params: Union[Dict, FrozenDict], apply_fn, regularization: float
 ) -> Tuple[Tuple[Loss, CorrectRatio], Gradients]:
     ...
 
@@ -88,28 +80,30 @@ loss_grad_fn = jax.value_and_grad(loss_accuracy_fn, has_aux=True, argnums=1)
 
 
 def train_step(
-    batch: Batch, state: TrainState, normalize_by_length: bool
+    batch: Batch, state: TrainState, regularization: float
 ) -> Tuple[TrainState, Tuple[Loss, CorrectRatio]]:
     (loss, accuracy), gradients = loss_grad_fn(
-        batch, state.params, state.apply_fn, normalize_by_length
+        batch, state.params, state.apply_fn, regularization
     )
     new_state = state.apply_gradients(grads=gradients)
     return new_state, (loss, accuracy)
 
 
 def jit_train_step(
-    batch: Batch, state: TrainState, normalize_by_length: bool
+    batch: Batch, state: TrainState, regularization: float
 ) -> Tuple[TrainState, Tuple[Loss, CorrectRatio]]:
     ...
 
 
 jit_train_step = jax.jit(
-    train_step, static_argnames=["normalize_by_length"], donate_argnums=1
+    train_step,
+    static_argnames=["normalize_by_length", "regularization"],
+    donate_argnums=1,
 )
 
 
 def jit_loss_accuracy_fn(
-    batch: Batch, params: FrozenDict, apply_fn: Callable, normalize_by_length: bool
+    batch: Batch, params: FrozenDict, apply_fn: Callable, regularization: float
 ) -> Tuple[Loss, CorrectRatio]:
     ...
 
@@ -123,7 +117,7 @@ def evaluate_model(
     apply_fn: Callable,
     params: FrozenDict,
     dataloader: Iterator[Batch],
-    normalize_by_length: bool = False,
+    regularization: float,
     num_eval_steps: Optional[int] = None,
 ) -> EvalStats:
     loss_tally = 0.0
@@ -133,9 +127,7 @@ def evaluate_model(
     for batch in tqdm(
         dataloader, ncols=80, desc="Evaluating", leave=False, total=num_eval_steps
     ):
-        loss, accuracy = jit_loss_accuracy_fn(
-            batch, params, apply_fn, normalize_by_length
-        )
+        loss, accuracy = jit_loss_accuracy_fn(batch, params, apply_fn, regularization)
         loss_tally += loss.item()
         accuracy_tally += accuracy.item()
         num_batches += 1
@@ -151,6 +143,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--learning_rate", type=float)
     parser.add_argument("--learning_rate_min", type=float, default=-1)
+    parser.add_argument("--regularization", type=float, default=0)
     parser.add_argument("--base_hf_model")
     parser.add_argument("--hf_dataset_path")
     parser.add_argument("--hf_tokenizer", required=False, default=None)
@@ -175,6 +168,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     learning_rate: float = args.learning_rate
     learning_rate_min: float = args.learning_rate_min
+    regularization: float = args.regularization
     base_hf_model: str = args.base_hf_model
     hf_dataset_path: str = args.hf_dataset_path
     hf_tokenizer: Optional[str] = args.hf_tokenizer
@@ -235,7 +229,7 @@ if __name__ == "__main__":
     for batch in tqdm(train_dataloader, ncols=80, total=num_train_steps):
         train_state: TrainState
         train_state, (loss, accuracy) = jit_train_step(
-            batch, train_state, normalize_by_length
+            batch, train_state, regularization
         )
 
         stats = {"train_loss": loss, "train_accuracy": accuracy}
@@ -245,7 +239,7 @@ if __name__ == "__main__":
                 model.__call__,
                 train_state.params,
                 init_eval_dataloader(),
-                normalize_by_length,
+                regularization,
                 num_eval_steps,
             )
             stats = {**stats, **{"validation_" + k: v for k, v in eval_stats.items()}}
